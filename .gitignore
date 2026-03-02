@@ -1,0 +1,17 @@
+amct_log
+datasets
+quantization/__pycache__
+quantization/amct_log
+quantization/output
+weights
+
+.vscode
+
+temp*/
+zz_temp/
+
+*.onnx
+
+CANN社区版 8.5.0 AMCT模型压缩工具用户指南 01*
+
+plot/
