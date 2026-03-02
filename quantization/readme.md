@@ -32,6 +32,7 @@
 - `opencv-python`
 - `numpy`
 - `torch`
+- `tqdm`（用于显示校准/评估进度条）
 
 另外脚本会复用以下仓库代码：
 
@@ -84,4 +85,3 @@ python3 /workspace/quantization/auto_quant_personcar.py \
 - 若校准图片不足（小于 `batch-num * batch-size`），脚本会报错退出。
 - 自动量化会多次调用评测流程，若耗时较长可先减小 `--eval-max-images` 做快速验证，再使用全量评测。
 - 若出现 AMCT 自定义算子相关报错，请先确认 AMCT 环境变量与安装版本匹配。
-

@@ -23,6 +23,10 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import torch
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    tqdm = None
 
 import amct_onnx as amct
 from amct_onnx.common.auto_calibration import AutoCalibrationEvaluatorBase
@@ -35,6 +39,12 @@ if ALGO_SERVER_ROOT not in sys.path:
 import LABELS  # noqa: E402
 from src import utils  # noqa: E402
 from vision import letterbox, nms_one, scale_boxes  # noqa: E402
+
+
+def progress_bar(iterable, total: int, desc: str):
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True, leave=False)
 
 
 def collect_images(root: str) -> List[str]:
@@ -134,7 +144,7 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
             )
 
         session = create_session(model_file)
-        for idx in range(self.batch_num):
+        for idx in progress_bar(range(self.batch_num), total=self.batch_num, desc="校准进度"):
             begin = idx * self.batch_size
             end = begin + self.batch_size
             batch_paths = self.calibration_images[begin:end]
@@ -226,7 +236,7 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
             batch_img_paths = []
             batch_raw_images = []
 
-        for img_path in self.eval_images:
+        for img_path in progress_bar(self.eval_images, total=len(self.eval_images), desc="评估进度"):
             im0 = cv2.imread(img_path)
             if im0 is None:
                 continue
@@ -267,7 +277,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="/workspace/quantization/auto_quant_personcar_result",
+        default="/workspace/quantization/out/auto_quant_personcar_result",
         help="Output directory",
     )
     parser.add_argument("--batch-num", type=int, default=8, help="Calibration batch number")
