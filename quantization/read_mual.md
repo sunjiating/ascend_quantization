@@ -11,7 +11,7 @@
 
 1. `amct.create_quant_config(...)`
 2. `amct.quantize_model(...)`
-3. 对 `modified_model.onnx` 执行校准前向（`batch_num` 轮）
+3. 对 `modified_model.onnx` 执行校准前向（迭代数由 `calib_samples/calib_iters/batch_num` 决定）
 4. `amct.save_model(...)` 导出 `fake_quant` 和 `deploy` 模型
 
 ## 2. 运行方式
@@ -20,8 +20,9 @@
 
 ```bash
 python3 /workspace/quantization/manual_quant_perscar.py \
-  --batch-num 1 \
-  --batch-size 1
+  --batch-num 8 \
+  --batch-size 4 \
+  --calib-samples 800
 ```
 
 常用完整示例：
@@ -32,15 +33,18 @@ python3 /workspace/quantization/manual_quant_perscar.py \
   --calibration-dir /workspace/datasets/person_car_animal-1101 \
   --output-dir /workspace/quantization/out/manual_quant_perscar_result \
   --batch-num 8 \
-  --batch-size 16 \
+  --batch-size 4 \
+  --calib-iters 200 \
   --input-width 768 \
   --input-height 416
 ```
 
 ## 3. 关键参数
 
-- `--batch-num`：校准批次数（AMCT 要求校准前向次数 `>= batch_num`）
+- `--batch-num`：AMCT 要求的最小校准批次数（不等于总校准样本）
 - `--batch-size`：每个批次图片数
+- `--calib-iters`：实际校准前向迭代数（`0` 表示跟随 `batch_num`）
+- `--calib-samples`：目标校准样本数（优先级高于 `calib-iters`，脚本内部按 `ceil(samples/batch_size)` 转为迭代数）
 - `--activation-offset / --no-activation-offset`：是否启用 activation offset
 - `--skip-layers`：逗号分隔的“跳过量化节点名”
 - `--nuq --nuq-config <file>`：启用非均匀量化并指定配置文件
@@ -91,7 +95,18 @@ PY
 
 把这些名称按需放入 `--skip-layers` 即可跳过对应节点量化。
 
-## 5. 输出文件
+## 5. 关于校准数据量
+
+当前脚本已将 `batch_num` 与校准数据量解耦。实际校准迭代数规则：
+
+1. 若设置了 `--calib-samples (>0)`，则 `iterations = ceil(calib_samples / batch_size)`
+2. 否则若设置了 `--calib-iters (>0)`，则 `iterations = calib_iters`
+3. 否则 `iterations = batch_num`
+4. 最终保证 `iterations >= batch_num`（满足 AMCT 最小要求）
+
+总校准样本数约为：`iterations * batch_size`。
+
+## 6. 输出文件
 
 运行完成后，默认会生成：
 

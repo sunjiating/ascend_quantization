@@ -14,6 +14,7 @@ Evaluator design:
 """
 
 import argparse
+import math
 import os
 import re
 import sys
@@ -141,6 +142,8 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
         eval_data_dir: str,
         batch_num: int,
         batch_size: int,
+        calibration_iters: int,
+        calibration_samples: int,
         expected_metric_loss: float,
         input_width: int,
         input_height: int,
@@ -152,6 +155,8 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
         super().__init__()
         self.batch_num = int(batch_num)
         self.batch_size = int(batch_size)
+        self.calibration_iters = int(calibration_iters)
+        self.calibration_samples = int(calibration_samples)
         self.expected_metric_loss = float(expected_metric_loss)
         self.input_wh = (int(input_width), int(input_height))
         self.input_hw = (int(input_height), int(input_width))
@@ -185,17 +190,22 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
         return normalize_output(output_value)
 
     def calibration(self, model_file: str):
-        required = self.batch_num * self.batch_size
-        if len(self.calibration_images) < required:
-            raise RuntimeError(
-                f"Calibration images are insufficient: need {required}, got {len(self.calibration_images)}."
-            )
+        if not self.calibration_images:
+            raise RuntimeError("Calibration images are not found.")
+
+        if self.calibration_samples > 0:
+            iterations = int(math.ceil(float(self.calibration_samples) / float(self.batch_size)))
+        elif self.calibration_iters > 0:
+            iterations = self.calibration_iters
+        else:
+            iterations = self.batch_num
+        iterations = max(iterations, self.batch_num)
 
         session = create_session(model_file)
-        for idx in progress_bar(range(self.batch_num), total=self.batch_num, desc="校准进度"):
-            begin = idx * self.batch_size
-            end = begin + self.batch_size
-            batch_paths = self.calibration_images[begin:end]
+        image_count = len(self.calibration_images)
+        for idx in progress_bar(range(iterations), total=iterations, desc="校准进度"):
+            start = (idx * self.batch_size) % image_count
+            batch_paths = [self.calibration_images[(start + k) % image_count] for k in range(self.batch_size)]
             batch_data = []
             for img_path in batch_paths:
                 im0 = cv2.imread(img_path)
@@ -331,6 +341,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-num", type=int, default=8, help="Calibration batch number")
     parser.add_argument("--batch-size", type=int, default=16, help="Batch size for calibration/evaluation")
     parser.add_argument(
+        "--calib-iters",
+        type=int,
+        default=0,
+        help="Actual calibration forward iterations; 0 means use batch-num",
+    )
+    parser.add_argument(
+        "--calib-samples",
+        type=int,
+        default=0,
+        help="Target calibration image count; if >0, overrides calib-iters",
+    )
+    parser.add_argument(
         "--expected-metric-loss",
         type=float,
         default=0.005,
@@ -367,6 +389,15 @@ def main():
     args = parse_args()
     patch_amct_auto_calibration_helper()
 
+    if args.batch_num <= 0:
+        raise RuntimeError(f"batch-num must be > 0, got {args.batch_num}")
+    if args.batch_size <= 0:
+        raise RuntimeError(f"batch-size must be > 0, got {args.batch_size}")
+    if args.calib_iters < 0:
+        raise RuntimeError(f"calib-iters must be >= 0, got {args.calib_iters}")
+    if args.calib_samples < 0:
+        raise RuntimeError(f"calib-samples must be >= 0, got {args.calib_samples}")
+
     model_file = os.path.realpath(args.model)
     if not os.path.isfile(model_file):
         raise RuntimeError(f"Model not found: {model_file}")
@@ -400,6 +431,8 @@ def main():
         eval_data_dir=eval_data_dir,
         batch_num=args.batch_num,
         batch_size=args.batch_size,
+        calibration_iters=args.calib_iters,
+        calibration_samples=args.calib_samples,
         expected_metric_loss=args.expected_metric_loss,
         input_width=args.input_width,
         input_height=args.input_height,

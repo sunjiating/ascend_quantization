@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import math
 import os
 from pathlib import Path
 from typing import List, Sequence, Tuple
@@ -84,24 +85,36 @@ def onnx_forward(
     input_wh: Tuple[int, int],
     stride: int = 32,
 ) -> None:
-    required = int(batch_size) * int(iterations)
-    if len(calibration_images) < required:
-        raise RuntimeError(
-            f"calibration images are insufficient: need {required}, got {len(calibration_images)}"
-        )
+    if not calibration_images:
+        raise RuntimeError("no calibration images found")
 
     session = create_session(onnx_model)
     input_name = session.get_inputs()[0].name
+    image_count = len(calibration_images)
 
     for idx in range(iterations):
-        begin = idx * batch_size
-        end = begin + batch_size
-        batch_paths = calibration_images[begin:end]
+        start = (idx * batch_size) % image_count
+        batch_paths = [calibration_images[(start + j) % image_count] for j in range(batch_size)]
         batch_data = [preprocess_image(Path(p), input_wh, stride) for p in batch_paths]
         batch_input = np.stack(batch_data, axis=0)
         output_value = session.run(None, {input_name: batch_input})[0]
         _ = normalize_output(output_value)
         print(f"[Calibration] iteration {idx + 1}/{iterations} finished.")
+
+
+def resolve_calibration_iterations(
+    batch_num: int,
+    batch_size: int,
+    calib_iters: int,
+    calib_samples: int,
+) -> int:
+    if calib_samples > 0:
+        resolved = int(math.ceil(float(calib_samples) / float(batch_size)))
+    elif calib_iters > 0:
+        resolved = int(calib_iters)
+    else:
+        resolved = int(batch_num)
+    return max(int(batch_num), resolved)
 
 
 def parse_args() -> argparse.Namespace:
@@ -120,12 +133,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="/workspace/quantization/out/manual_quant_perscar_result",
+        default="/workspace/quantization/out/manual_quant_perscar_result_2",
         help="output directory",
     )
-    parser.add_argument("--batch-num", type=int, default=8, help="calibration batch number；" \
-                        "总校准数据大小= batch-num * batch-size")
-    parser.add_argument("--batch-size", type=int, default=16, help="batch size for calibration")
+    parser.add_argument("--batch-num", type=int, default=8, help="AMCT required minimum calibration batches")
+    parser.add_argument("--batch-size", type=int, default=8, help="batch size for calibration")
+    parser.add_argument(
+        "--calib-iters",
+        type=int,
+        default=0,
+        help="actual calibration forward iterations; 0 means use batch-num",
+    )
+    parser.add_argument(
+        "--calib-samples",
+        type=int,
+        default=1101,
+        help="target calibration image count; if >0, overrides calib-iters (iterations=ceil(samples/batch-size))",
+    )
     parser.add_argument("--input-width", type=int, default=768, help="model input width")
     parser.add_argument("--input-height", type=int, default=416, help="model input height")
     parser.add_argument("--skip-layers", default="", help="comma-separated layer names to skip")
@@ -160,21 +184,31 @@ def main() -> None:
 
     batch_num = int(args.batch_num)
     batch_size = int(args.batch_size)
+    calib_iters = int(args.calib_iters)
+    calib_samples = int(args.calib_samples)
     input_wh = (int(args.input_width), int(args.input_height))
     skip_layers = [s.strip() for s in args.skip_layers.split(",") if s.strip()]
     if batch_num <= 0:
         raise RuntimeError(f"batch-num must be > 0, got {batch_num}")
     if batch_size <= 0:
         raise RuntimeError(f"batch-size must be > 0, got {batch_size}")
+    if calib_iters < 0:
+        raise RuntimeError(f"calib-iters must be >= 0, got {calib_iters}")
+    if calib_samples < 0:
+        raise RuntimeError(f"calib-samples must be >= 0, got {calib_samples}")
     if input_wh[0] <= 0 or input_wh[1] <= 0:
         raise RuntimeError(f"input size must be > 0, got {input_wh}")
 
     calibration_images = collect_images(calibration_dir)
-    need_count = batch_num * batch_size
-    if len(calibration_images) < need_count:
-        raise RuntimeError(
-            f"insufficient calibration images under {calibration_dir}: need {need_count}, got {len(calibration_images)}"
-        )
+    if not calibration_images:
+        raise RuntimeError(f"no calibration images found under {calibration_dir}")
+    calibration_iterations = resolve_calibration_iterations(
+        batch_num=batch_num,
+        batch_size=batch_size,
+        calib_iters=calib_iters,
+        calib_samples=calib_samples,
+    )
+    used_samples = calibration_iterations * batch_size
 
     config_json_file = os.path.join(output_dir, "config.json")
     record_file = os.path.join(output_dir, "record.txt")
@@ -212,7 +246,7 @@ def main() -> None:
         onnx_model=modified_model,
         calibration_images=calibration_images,
         batch_size=batch_size,
-        iterations=batch_num,
+        iterations=calibration_iterations,
         input_wh=input_wh,
         stride=32,
     )
@@ -228,6 +262,10 @@ def main() -> None:
     print(f"Fake quant model: {save_prefix}_fake_quant_model.onnx")
     print(f"Deploy model: {save_prefix}_deploy_model.onnx")
     print(f"Skip layers count: {len(skip_layers)}")
+    print(f"AMCT batch_num: {batch_num}")
+    print(f"Calibration iterations: {calibration_iterations}")
+    print(f"Calibration samples used (with repeat): {used_samples}")
+    print(f"Unique calibration images available: {len(calibration_images)}")
 
 
 if __name__ == "__main__":
