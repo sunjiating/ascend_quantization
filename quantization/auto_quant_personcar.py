@@ -31,6 +31,7 @@ except ImportError:  # pragma: no cover
 
 import amct_onnx as amct
 from amct_onnx.common.auto_calibration import AutoCalibrationEvaluatorBase
+from utils import letterbox, nms_one, scale_boxes  # noqa: E402
 
 
 ALGO_SERVER_ROOT = "/workspace/AlgoServerScript"
@@ -39,7 +40,6 @@ if ALGO_SERVER_ROOT not in sys.path:
 
 import LABELS  # noqa: E402
 from src import utils  # noqa: E402
-from vision import letterbox, nms_one, scale_boxes  # noqa: E402
 
 
 def patch_amct_auto_calibration_helper():
