@@ -11,6 +11,8 @@ temp*/
 zz_temp/
 
 *.onnx
+*.pt
+*.om
 
 CANN社区版 8.5.0 AMCT模型压缩工具用户指南 01*
 

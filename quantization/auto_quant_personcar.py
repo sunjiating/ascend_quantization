@@ -15,6 +15,7 @@ Evaluator design:
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 from typing import List, Tuple
@@ -39,6 +40,53 @@ if ALGO_SERVER_ROOT not in sys.path:
 import LABELS  # noqa: E402
 from src import utils  # noqa: E402
 from vision import letterbox, nms_one, scale_boxes  # noqa: E402
+
+
+def patch_amct_auto_calibration_helper():
+    """
+    Patch AMCT auto calibration helper for multi-batch dump files.
+
+    AMCT 8.5.0 may collect all dump files across batches for one layer and
+    treat them as multiple inputs, which can cause:
+    IndexError: list assignment index out of range
+    """
+    try:
+        from amct_onnx.utils.auto_calibration_helper import AutoCalibrationHelper
+    except Exception:
+        return
+
+    if getattr(AutoCalibrationHelper, "_fm_file_patch_applied", False):
+        return
+
+    original_find_fm_file_path = AutoCalibrationHelper.find_fm_file_path
+
+    def _patched_find_fm_file_path(self, layer_name):
+        layer_prefix = layer_name.replace("/", "_")
+        pattern = re.compile(
+            rf"^{re.escape(layer_prefix)}_act_calibration_layer_dump(\d+)_(\d+)\.bin$"
+        )
+        log_dir = os.path.realpath(self.amct_log_dir)
+
+        # Keep one dump file per input index, prefer the smallest batch index.
+        per_input_file = {}
+        for file_name in os.listdir(log_dir):
+            match = pattern.match(file_name)
+            if not match:
+                continue
+            input_idx = int(match.group(1))
+            batch_idx = int(match.group(2))
+            file_path = os.path.join(log_dir, file_name)
+            if input_idx not in per_input_file or batch_idx < per_input_file[input_idx][0]:
+                per_input_file[input_idx] = (batch_idx, file_path)
+
+        if per_input_file:
+            return [per_input_file[idx][1] for idx in sorted(per_input_file.keys())]
+
+        # Fallback to AMCT original logic.
+        return original_find_fm_file_path(self, layer_name)
+
+    AutoCalibrationHelper.find_fm_file_path = _patched_find_fm_file_path
+    AutoCalibrationHelper._fm_file_patch_applied = True
 
 
 def progress_bar(iterable, total: int, desc: str):
@@ -317,6 +365,7 @@ def parse_args() -> argparse.Namespace:
 
 def main():
     args = parse_args()
+    patch_amct_auto_calibration_helper()
 
     model_file = os.path.realpath(args.model)
     if not os.path.isfile(model_file):
