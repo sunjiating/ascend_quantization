@@ -15,6 +15,8 @@
 优先使用已准备好的镜像：
 
 - `quay.io/ascend/cann:8.2.rc1-310p-ubuntu22.04-py3.11`
+记得要将AlgoServerScript的代码挂载到容器/workspace/AlgoServerScript目录下  
+具体docker运行配置参照docker-compose.yml
 
 若需自行搭建，可参考如下步骤（按需执行）：
 
