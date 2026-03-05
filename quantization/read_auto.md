@@ -1,87 +1,92 @@
-# PersonCarAnimal ONNX 量化说明
+# PersonCarAnimal 自动精度量化说明（AMCT ONNX）
 
-## 1. 目标
+## 1. 目标与文件
 
-基于 AMCT ONNX 官方“基于精度的自动量化”流程，对以下模型进行量化：
+- 脚本：`/workspace/quantization/auto_quant_personcar.py`
+- 待量化模型（默认）：`/workspace/models/PersonCarAnimal_od-v3-x-bestp-d4-416-768_20251203.onnx`
+- 校准集（默认）：`/workspace/datasets/person_car_animal-1101`
+- 评测集（默认）：`/workspace/AlgoServerScript/datasets/person_car`
+- 输出目录（默认）：`/workspace/quantization/out/auto_quant_personcar_result`
 
-- 待量化模型：`/workspace/models/PersonCarAnimal_od-v3-x-bestp-d4-416-768_20251203.onnx`
-- 校准数据集：`/workspace/datasets/person_car_animal-1101`
-- 评测数据集：`/workspace/AlgoServerScript/datasets/person_car`
+## 2. 流程说明
 
-量化脚本：`/workspace/quantization/auto_quant_personcar.py`
-
-## 2. 实现说明
-
-脚本实现遵循文档接口流程：
+脚本基于 AMCT 自动量化流程：
 
 1. `amct.create_quant_config(...)`
 2. `amct.accuracy_based_auto_calibration(...)`
 
-并实现了 `AutoCalibrationEvaluatorBase` 的三个回调函数：
+评估器 `PersonCarAutoCalibrationEvaluator` 实现：
 
-- `calibration(model_file)`：使用校准集做前向推理，保证推理 batch 数不小于 `batch_num`
-- `evaluate(model_file)`：参考 `AlgoServerScript/algo_server.py` 的人车 mAP 流程，计算 `mAP@0.25:0.7`
-- `metric_eval(original_metric, new_metric)`：以 mAP 损失是否小于阈值判定量化是否达标
+- `calibration(model_file)`：使用校准集做前向，保证校准迭代数不小于 `batch_num`
+- `evaluate(model_file)`：计算 `mAP@0.25:0.7`（`map_2570`）
+- `metric_eval(original_metric, new_metric)`：以 `expected_metric_loss` 判断精度是否达标
 
 ## 3. 依赖要求
 
-需要可用的 Python3 环境，并安装以下依赖（至少）：
+至少需要：
 
 - `amct_onnx`
-- `onnxruntime`
+- `onnxruntime`（建议具备 CUDA provider）
 - `opencv-python`
 - `numpy`
 - `torch`
-- `tqdm`（用于显示校准/评估进度条）
+- `tqdm`（可选，提供进度条）
 
-另外脚本会复用以下仓库代码：
+并依赖 AlgoServerScript 中的评测代码：
 
-- `AlgoServerScript/src/utils.py`
-- `AlgoServerScript/vision.py`
-- `AlgoServerScript/LABELS.py`
+- `/workspace/AlgoServerScript/src/utils.py`
+- `/workspace/AlgoServerScript/LABELS.py`
 
 ## 4. 运行方式
 
-进入工作目录后执行：
+### 4.1 最小示例
 
 ```bash
 python3 /workspace/quantization/auto_quant_personcar.py
 ```
 
-常用参数示例（调大校准数据量、全量评测）：
+### 4.2 常用示例
 
 ```bash
 python3 /workspace/quantization/auto_quant_personcar.py \
-  --batch-num 8 \
-  --batch-size 4 \
+  --model /workspace/models/PersonCarAnimal_od-v3-x-bestp-d4-416-768_20251203.onnx \
+  --calibration-dir /workspace/datasets/person_car_animal-1101 \
+  --eval-data-dir /workspace/AlgoServerScript/datasets/person_car \
+  --output-dir /workspace/quantization/out/auto_quant_personcar_result \
+  --batch-num 4 \
+  --batch-size 8 \
+  --calib-samples 1101 \
   --expected-metric-loss 0.005 \
   --eval-max-images 0
 ```
 
-## 5. 关键参数说明
+## 5. 关键参数
 
-- `--batch-num`：校准 batch 数，实际校准图片数约为 `batch-num * batch-size`
-- `--batch-size`：校准和评测推理 batch 大小
-- `--expected-metric-loss`：允许的 mAP 下降阈值（绝对值）
-- `--eval-max-images`：评测图片上限，`0` 表示评测全部图片
-- `--activation-offset / --no-activation-offset`：是否启用 activation offset
-- `--skip-layers`：逗号分隔的跳过量化层名
+- `--batch-num`：AMCT 最小校准批次数要求（默认 `4`）
+- `--batch-size`：校准和评估 batch 大小（默认 `8`）
+- `--calib-samples`：目标校准样本数，`>0` 时优先级高于 `--calib-iters`
+- `--calib-iters`：实际校准迭代数，默认 `0`（由 `batch-num`/`calib-samples` 决定）
+- `--expected-metric-loss`：允许的 mAP 绝对损失（默认 `0.001`）
+- `--eval-max-images`：评估图像数上限，`0` 表示全量
+- `--conf-thres` / `--iou-thres` / `--max-det`：评估阶段 NMS 参数
+- `--activation-offset` / `--no-activation-offset`：控制 activation offset（默认启用）
+- `--skip-layers`：逗号分隔层名，指定跳过量化层
+- `--strategy` / `--sensitivity`：自动量化策略参数（当前脚本内部默认使用 `IncrementalStrategy(step_ratio=0.2)`）
 
 ## 6. 输出文件
 
-默认输出目录：
+默认输出目录下主要产物：
 
-- `/workspace/quantization/auto_quant_personcar_result`
+- `config.json`：量化配置
+- `scale_offset_record.txt`：量化 scale/offset 记录
+- `personcar_model_fake_quant_model.onnx`：仿真量化模型
+- `personcar_model_deploy_model.onnx`：部署模型
 
-主要文件：
+自动量化过程中还可能生成 AMCT 分析文件（灵敏度排序、回退过程信息等），文件名以实际 AMCT 版本输出为准。
 
-- `config.json`：自动生成的量化配置
-- `scale_offset_record.txt`：量化因子记录文件
-- `personcar_model_fake_quant_model.onnx`：可在 ONNX Runtime 上验证精度的仿真模型
-- `personcar_model_deploy_model.onnx`：部署模型（用于后续 ATC 转换）
+## 7. 常见问题
 
-## 7. 注意事项
-
-- 若校准图片不足（小于 `batch-num * batch-size`），脚本会报错退出。
-- 自动量化会多次调用评测流程，若耗时较长可先减小 `--eval-max-images` 做快速验证，再使用全量评测。
-- 若出现 AMCT 自定义算子相关报错，请先确认 AMCT 环境变量与安装版本匹配。
+- `Calibration directory not found`：校准目录路径错误或未挂载。
+- `Evaluation data directory not found`：评估目录错误，或不包含可读取图片。
+- 评估很慢：先用 `--eval-max-images 200` 快速验证，再切回全量评估。
+- 精度下降超阈值：适当放宽 `--expected-metric-loss`，或增加 `--skip-layers` 做手动回退。
