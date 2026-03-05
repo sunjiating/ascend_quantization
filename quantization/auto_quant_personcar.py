@@ -338,8 +338,8 @@ def parse_args() -> argparse.Namespace:
         default="/workspace/quantization/out/auto_quant_personcar_result",
         help="Output directory",
     )
-    parser.add_argument("--batch-num", type=int, default=8, help="Calibration batch number")
-    parser.add_argument("--batch-size", type=int, default=16, help="Batch size for calibration/evaluation")
+    parser.add_argument("--batch-num", type=int, default=4, help="Calibration batch number")
+    parser.add_argument("--batch-size", type=int, default=8, help="Batch size for calibration/evaluation")
     parser.add_argument(
         "--calib-iters",
         type=int,
@@ -349,13 +349,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--calib-samples",
         type=int,
-        default=0,
+        default=1101,
         help="Target calibration image count; if >0, overrides calib-iters",
     )
     parser.add_argument(
         "--expected-metric-loss",
         type=float,
-        default=0.005,
+        default=0.001,
         help="Allowed mAP loss (absolute value)",
     )
     parser.add_argument("--input-width", type=int, default=768, help="Model input width")
@@ -366,7 +366,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--eval-max-images",
         type=int,
-        default=400,
+        default=0,
         help="Max eval images. Set 0 to evaluate all images.",
     )
     parser.add_argument("--strategy", default="BinarySearch", help="Auto calibration strategy")
@@ -442,13 +442,21 @@ def main():
         eval_max_images=args.eval_max_images,
     )
 
+    from incremental_strategy import IncrementalStrategy # 导入自定义增量策略
+
+    # 调用AMCT量化
+    # 使用增量策略（适合精度差一点点的场景）
+    # step_ratio=0.05 表示每次还原5%的层，在速度和精度之间取得平衡
+    incremental_strategy = IncrementalStrategy(step_ratio=0.2, min_step=1)
+
     amct.accuracy_based_auto_calibration(
         model_file=model_file,
         model_evaluator=evaluator,
         config_file=config_file,
         record_file=record_file,
         save_dir=save_prefix,
-        strategy=args.strategy,
+        # strategy=args.strategy,
+        strategy=incremental_strategy,
         sensitivity=args.sensitivity,
     )
 

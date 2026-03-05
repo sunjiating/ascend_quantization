@@ -133,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-dir",
-        default="/workspace/quantization/out/manual_quant_perscar_result_2",
+        default="/workspace/quantization/out/manual_quant_perscar_result",
         help="output directory",
     )
     parser.add_argument("--batch-num", type=int, default=8, help="AMCT required minimum calibration batches")
@@ -214,7 +214,27 @@ def main() -> None:
     record_file = os.path.join(output_dir, "record.txt")
     modified_model = os.path.join(output_dir, "modified_model.onnx")
     save_prefix = os.path.join(output_dir, Path(model_file).stem)
-
+    skip_layers = [
+        "/model.41/cv4/conv/Conv", 
+        "/model.3/cv1/conv/Conv",
+        "/model.23/AveragePool",
+        "/model.2/conv/Conv",
+        "/model.42/cv3.0/cv3.0.0/conv/Conv",
+        "/model.3/cv2/cv2.0/m/m.0/cv1/conv/Conv",
+        "/model.19/cv2/cv2.0/m/m.0/cv2/conv/Conv",
+        "/model.3/cv2/cv2.0/m/m.1/cv1/conv/Conv",
+        "/model.42/cv3.1/cv3.1.1/conv/Conv",
+        "/model.26/AveragePool",
+        "/model.36/AveragePool",
+        "/model.42/cv3.1/cv3.1.0/conv/Conv",
+        "/model.10/conv/Conv",
+        "/model.38/cv1/conv/Conv",
+        "/model.36/cv2/conv/Conv",
+        "/model.42/cv3.0/cv3.0.1/conv/Conv",
+        "/model.39/AveragePool",
+        "/model.28/cv1/conv/Conv",
+        "/model.38/cv4/conv/Conv",
+        ]
     config_defination = None
     if args.nuq:
         if not args.nuq_config:
