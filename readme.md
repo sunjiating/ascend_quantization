@@ -156,18 +156,24 @@ atc \
   --host_env_cpu="aarch64" --framework=5 --log=info \
   --input_format=NCHW \
   --insert_op_conf="/workspace/objectdetectV3_768x416_YUV2BGR.cfg" \
-  --model="/workspace/quantization/out/manual_quant_perscar_result/PersonCarAnimal_od-v3-x-bestp-d4-416-768_20251203_deploy_model.onnx" \
-  --output="/workspace/PersonCarAnimal_od-v3-x-bestp-d4-int8-4-416-768_20251203" \
+  --model="/workspace/quantization/out/manual_quant_smoke_result2/SmokePhone_od-v5-1-x-best-d4-416-224-opset16_20251104_no_layernorm_deploy_model.onnx" \
+  --output="/workspace/SmokePhone_od-v5-1-x-best-d4-int8-416-224-opset16_20251104" \
   --soc_version="Ascend310P3" \
-  --input_shape="input:4,3,416,768"
+  --input_shape="images:4,3,416,224"
 
 # 自动量化模型（自测场景）
 atc \
   --precision_mode_v2="cube_fp16in_fp32out" \
   --framework=5 --host_env_cpu="aarch64" --log=info \
   --input_format=NCHW \
-  --model="/workspace/quantization/out/auto_quant_personcar_result/personcar_model_deploy_model.onnx" \
-  --output="/workspace/quantization/PersonCarAnimal_od-v3-x-bestp-d4-int8-416-768_20251203" \
+  --model="/workspace/quantization/out/manual_quant_smoke_result/SmokePhone_od-v5-1-x-best-d4-416-224-opset16_20251104_deploy_model.onnx" \
+  --output="/workspace/quantization/SmokePhone_od-v5-1-x-best-d4-416-224-opset16_20251104" \
   --soc_version="Ascend310P3" \
   --input_shape="input:1,3,416,768"
 ```
+
+# 注意！
+对于SmokePhone_od-v5-1-x-best-d4-416-224模型（包含layernorm算子），自动精度量化失效
+首先执行python /workspace/quantization/rewrite_layernorm_onnx.py将layernorm算子拆分成基础算子
+然后执行python /workspace/quantization/manual_quant_smoke.py量化
+最后执行bash /workspace/atc.sh模型转换为om

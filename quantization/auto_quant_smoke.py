@@ -1,18 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-PersonCarAnimal ONNX model accuracy-based auto quantization with AMCT.
-
-Workflow:
-1. create_quant_config
-2. accuracy_based_auto_calibration
-
-Evaluator design:
-- calibration(): use /workspace/datasets/person_car_animal-1101
-- evaluate(): compute detection mAP (IoU 0.25:0.7) on /workspace/AlgoServerScript/datasets/person_car
-"""
-
 import argparse
 import math
 import os
@@ -25,6 +13,11 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 import torch
+import torch.nn.functional as F
+import torchvision
+import torchvision.transforms as T
+from PIL import Image
+
 try:
     from tqdm import tqdm
 except ImportError:  # pragma: no cover
@@ -32,7 +25,6 @@ except ImportError:  # pragma: no cover
 
 import amct_onnx as amct
 from amct_onnx.common.auto_calibration import AutoCalibrationEvaluatorBase
-from utils import letterbox, nms_one, scale_boxes  # noqa: E402
 
 
 ALGO_SERVER_ROOT = "/workspace/AlgoServerScript"
@@ -44,13 +36,6 @@ from src import utils  # noqa: E402
 
 
 def patch_amct_auto_calibration_helper():
-    """
-    Patch AMCT auto calibration helper for multi-batch dump files.
-
-    AMCT 8.5.0 may collect all dump files across batches for one layer and
-    treat them as multiple inputs, which can cause:
-    IndexError: list assignment index out of range
-    """
     try:
         from amct_onnx.utils.auto_calibration_helper import AutoCalibrationHelper
     except Exception:
@@ -60,15 +45,13 @@ def patch_amct_auto_calibration_helper():
         return
 
     original_find_fm_file_path = AutoCalibrationHelper.find_fm_file_path
+    original_generate_single_model = AutoCalibrationHelper.generate_single_model
 
     def _patched_find_fm_file_path(self, layer_name):
         layer_prefix = layer_name.replace("/", "_")
-        pattern = re.compile(
-            rf"^{re.escape(layer_prefix)}_act_calibration_layer_dump(\d+)_(\d+)\.bin$"
-        )
+        pattern = re.compile(rf"^{re.escape(layer_prefix)}_act_calibration_layer_dump(\d+)_(\d+)\.bin$")
         log_dir = os.path.realpath(self.amct_log_dir)
 
-        # Keep one dump file per input index, prefer the smallest batch index.
         per_input_file = {}
         for file_name in os.listdir(log_dir):
             match = pattern.match(file_name)
@@ -83,10 +66,28 @@ def patch_amct_auto_calibration_helper():
         if per_input_file:
             return [per_input_file[idx][1] for idx in sorted(per_input_file.keys())]
 
-        # Fallback to AMCT original logic.
         return original_find_fm_file_path(self, layer_name)
 
+    def _patched_generate_single_model(self, layer_name, input_file_list):
+        # Safety net for AMCT versions where duplicate dump files cause
+        # input_file_list length > real node inputs.
+        try:
+            graph = self.original_graph
+            object_node = None
+            for node in graph.nodes:
+                if node.name == layer_name:
+                    object_node = node
+                    break
+            if object_node is not None and hasattr(object_node, "input"):
+                real_inputs = len(object_node.input)
+                if real_inputs > 0 and len(input_file_list) > real_inputs:
+                    input_file_list = input_file_list[:real_inputs]
+        except Exception:
+            pass
+        return original_generate_single_model(self, layer_name, input_file_list)
+
     AutoCalibrationHelper.find_fm_file_path = _patched_find_fm_file_path
+    AutoCalibrationHelper.generate_single_model = _patched_generate_single_model
     AutoCalibrationHelper._fm_file_patch_applied = True
 
 
@@ -106,22 +107,26 @@ def collect_images(root: str) -> List[str]:
     return images
 
 
+def collect_eval_images_recursive(eval_data_dir: str) -> List[str]:
+    # Support recursive dataset layout like:
+    # smoke_phone/{正样本,负样本,...}/images/*.jpg
+    all_images = collect_images(eval_data_dir)
+    normalized = [p.replace("\\", "/") for p in all_images]
+    images_with_standard_path = [p for p in normalized if "/images/" in p]
+    if images_with_standard_path:
+        return images_with_standard_path
+    return normalized
+
+
 def create_session(model_file: str) -> ort.InferenceSession:
-    providers = ["CUDAExecutionProvider","CPUExecutionProvider"]
+    providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
     amct_so = getattr(amct, "AMCT_SO", None)
     if amct_so is None:
         return ort.InferenceSession(model_file, providers=providers)
-
     try:
         return ort.InferenceSession(model_file, amct_so, providers=providers)
     except TypeError:
         return ort.InferenceSession(model_file, sess_options=amct_so, providers=providers)
-
-
-def preprocess_image(im0_bgr: np.ndarray, input_wh: Tuple[int, int], stride: int) -> np.ndarray:
-    im, _, _ = letterbox(im0_bgr, input_wh, stride=stride)
-    im = im.transpose((2, 0, 1))[::-1]  # BGR -> RGB, HWC -> CHW
-    return np.ascontiguousarray(im, dtype=np.float32) / 255.0
 
 
 def normalize_output(output_value: np.ndarray) -> np.ndarray:
@@ -135,10 +140,128 @@ def normalize_output(output_value: np.ndarray) -> np.ndarray:
     return out
 
 
-class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
+def load_preprocessed_calibration(npy_file: str) -> np.ndarray:
+    if not os.path.isfile(npy_file):
+        raise RuntimeError(f"Calibration npy not found: {npy_file}")
+    data = np.load(npy_file)
+    if data.ndim == 3:
+        data = data[None, ...]
+    if data.ndim != 4:
+        raise RuntimeError(f"Calibration npy must be 4D, got {data.shape}")
+
+    # Accept NHWC and convert to NCHW.
+    if data.shape[-1] == 3 and data.shape[1] != 3:
+        data = np.transpose(data, (0, 3, 1, 2))
+
+    if data.shape[1] != 3:
+        raise RuntimeError(f"Calibration npy channel dim must be 3, got {data.shape}")
+    return np.ascontiguousarray(data, dtype=np.float32)
+
+
+def letterbox_resize(image: Image.Image, new_shape: Tuple[int, int], fill_color=(0, 0, 0)) -> Image.Image:
+    # new_shape: (h, w)
+    orig_w, orig_h = image.size
+    new_h, new_w = int(new_shape[0]), int(new_shape[1])
+
+    scale = min(new_w / orig_w, new_h / orig_h)
+    resize_w, resize_h = int(orig_w * scale), int(orig_h * scale)
+    pad_w, pad_h = new_w - resize_w, new_h - resize_h
+    pad_left, pad_top = pad_w // 2, pad_h // 2
+
+    image = image.resize((resize_w, resize_h), Image.BILINEAR)
+    new_image = Image.new("RGB", (new_w, new_h), fill_color)
+    new_image.paste(image, (pad_left, pad_top))
+    return new_image
+
+
+def preprocess_image(im0_bgr: np.ndarray, input_wh: Tuple[int, int]) -> np.ndarray:
+    # Align with /workspace/onnx_infer.py preprocessing.
+    im_pil = Image.fromarray(cv2.cvtColor(im0_bgr, cv2.COLOR_BGR2RGB))
+    resized = letterbox_resize(im_pil, new_shape=(input_wh[1], input_wh[0]))
+    tensor = T.ToTensor()(resized)
+    return np.ascontiguousarray(tensor.numpy(), dtype=np.float32)
+
+
+def denormalize_bbox_to_original(
+    bbox_pred: torch.Tensor,
+    orig_size: torch.Tensor,
+    input_size: Tuple[int, int],
+) -> torch.Tensor:
+    # input_size: (h, w)
+    bs, _, _ = bbox_pred.shape
+    device = bbox_pred.device
+    input_h, input_w = int(input_size[0]), int(input_size[1])
+
+    scale = torch.tensor([input_w, input_h, input_w, input_h], device=device).view(1, 1, 4)
+    bbox_scaled = bbox_pred * scale
+
+    bbox_orig = torch.zeros_like(bbox_scaled)
+    if bs != orig_size.shape[0] and orig_size.shape[0] == 1:
+        orig_size = orig_size.repeat(bs, 1)
+
+    for i in range(bs):
+        orig_w, orig_h = orig_size[i]
+        r = min(input_w / orig_w, input_h / orig_h)
+        new_w, new_h = int(orig_w * r), int(orig_h * r)
+        pad_w = (input_w - new_w) / 2
+        pad_h = (input_h - new_h) / 2
+
+        x1 = (bbox_scaled[i, :, 0] - pad_w) / r
+        y1 = (bbox_scaled[i, :, 1] - pad_h) / r
+        x2 = (bbox_scaled[i, :, 2] - pad_w) / r
+        y2 = (bbox_scaled[i, :, 3] - pad_h) / r
+        bbox_orig[i] = torch.stack([x1, y1, x2, y2], dim=-1)
+
+    return bbox_orig
+
+
+def postprocess_output(
+    output_per_image: np.ndarray,
+    orig_hw: Tuple[int, int],
+    input_wh: Tuple[int, int],
+    score_thresh: float,
+) -> np.ndarray:
+    # Align with /workspace/onnx_infer.py postprocessing.
+    boxes = torch.from_numpy(output_per_image[:, :4]).float().unsqueeze(0)
+    logits = torch.from_numpy(output_per_image[:, 4:]).float().unsqueeze(0)
+
+    bbox_pred = torchvision.ops.box_convert(boxes, in_fmt="cxcywh", out_fmt="xyxy")
+    orig_h, orig_w = int(orig_hw[0]), int(orig_hw[1])
+    orig_size = torch.tensor([[orig_w, orig_h]], dtype=torch.float32)
+    bbox_pred = denormalize_bbox_to_original(
+        bbox_pred,
+        orig_size,
+        input_size=(int(input_wh[1]), int(input_wh[0])),
+    )
+
+    scores = F.sigmoid(logits.squeeze(0))
+    scores, labels = torch.topk(scores, 1, dim=-1)
+    scores = scores.squeeze(-1)
+    labels = labels.squeeze(-1)
+    boxes_xyxy = bbox_pred.squeeze(0)
+
+    keep = scores >= float(score_thresh)
+    if not keep.any():
+        return np.zeros((0, 6), dtype=np.float32)
+
+    boxes_xyxy = boxes_xyxy[keep]
+    scores = scores[keep]
+    labels = labels[keep]
+
+    boxes_xyxy[:, 0::2] = boxes_xyxy[:, 0::2].clamp_(0, orig_w)
+    boxes_xyxy[:, 1::2] = boxes_xyxy[:, 1::2].clamp_(0, orig_h)
+
+    pred = torch.cat(
+        [boxes_xyxy, scores.unsqueeze(1), labels.float().unsqueeze(1)],
+        dim=1,
+    )
+    return pred.detach().cpu().numpy().astype(np.float32)
+
+
+class SmokeAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
     def __init__(
         self,
-        calibration_dir: str,
+        calibration_npy: str,
         eval_data_dir: str,
         batch_num: int,
         batch_size: int,
@@ -148,8 +271,6 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
         input_width: int,
         input_height: int,
         conf_thres: float,
-        iou_thres: float,
-        max_det: int,
         eval_max_images: int,
     ):
         super().__init__()
@@ -159,27 +280,30 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
         self.calibration_samples = int(calibration_samples)
         self.expected_metric_loss = float(expected_metric_loss)
         self.input_wh = (int(input_width), int(input_height))
-        self.input_hw = (int(input_height), int(input_width))
         self.conf_thres = float(conf_thres)
-        self.iou_thres = float(iou_thres)
-        self.max_det = int(max_det)
         self.eval_max_images = int(eval_max_images)
-        self.stride = 32
 
-        self.names = LABELS.PersonCarAnimal
-        self.names_merge = LABELS.PersonCarAnimal_merge
-        self.names_dataset = LABELS.PersonCarAnimal_dataset_merge
+        self.names = LABELS.smokephone
+        self.names_merge = LABELS.smokephone_merge
+        self.names_dataset = {}
         self.names_dic = {k: v for k, v in enumerate(self.names)}
         self.names_dic_mg = {k: v for k, v in enumerate(self.names_merge.keys())}
-
         self.filter_names: List[str] = []
         self.filter_names_mg: List[str] = []
-        self.iouv = torch.linspace(0.25, 0.7, 10)
+        self.iouv = torch.linspace(0.05, 0.5, 10)
         self.niou = self.iouv.numel()
 
-        self.calibration_images = collect_images(calibration_dir)
+        self.calibration_data = load_preprocessed_calibration(calibration_npy)
+        if self.calibration_data.shape[2] != self.input_wh[1] or self.calibration_data.shape[3] != self.input_wh[0]:
+            raise RuntimeError(
+                f"Calibration npy shape mismatch: got {self.calibration_data.shape}, "
+                f"expected N,3,{self.input_wh[1]},{self.input_wh[0]}"
+            )
+
         eval_images_dir = Path(eval_data_dir) / "images"
-        self.eval_images = collect_images(str(eval_images_dir if eval_images_dir.exists() else eval_data_dir))
+        self.eval_images = collect_eval_images_recursive(
+            str(eval_images_dir if eval_images_dir.exists() else eval_data_dir)
+        )
         if self.eval_max_images > 0:
             self.eval_images = self.eval_images[: self.eval_max_images]
 
@@ -190,8 +314,8 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
         return normalize_output(output_value)
 
     def calibration(self, model_file: str):
-        if not self.calibration_images:
-            raise RuntimeError("Calibration images are not found.")
+        if self.calibration_data.size == 0:
+            raise RuntimeError("Calibration data is empty.")
 
         if self.calibration_samples > 0:
             iterations = int(math.ceil(float(self.calibration_samples) / float(self.batch_size)))
@@ -202,17 +326,11 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
         iterations = max(iterations, self.batch_num)
 
         session = create_session(model_file)
-        image_count = len(self.calibration_images)
+        sample_count = int(self.calibration_data.shape[0])
         for idx in progress_bar(range(iterations), total=iterations, desc="校准进度"):
-            start = (idx * self.batch_size) % image_count
-            batch_paths = [self.calibration_images[(start + k) % image_count] for k in range(self.batch_size)]
-            batch_data = []
-            for img_path in batch_paths:
-                im0 = cv2.imread(img_path)
-                if im0 is None:
-                    raise RuntimeError(f"Failed to read calibration image: {img_path}")
-                batch_data.append(preprocess_image(im0, self.input_wh, self.stride))
-            batch_input = np.stack(batch_data, axis=0)
+            start = (idx * self.batch_size) % sample_count
+            batch_indices = [(start + k) % sample_count for k in range(self.batch_size)]
+            batch_input = self.calibration_data[batch_indices]
             _ = self._run_batch(session, batch_input)
 
     def evaluate(self, model_file: str):
@@ -220,7 +338,6 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
             raise RuntimeError("No evaluation images found.")
 
         session = create_session(model_file)
-
         stats = []
         stats_mg = []
         min_stats = []
@@ -238,7 +355,6 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
             nonlocal batch_inputs, batch_img_paths, batch_raw_images
             nonlocal stats, stats_mg, min_stats, medium_stats, large_stats
             nonlocal min_stats_mg, medium_stats_mg, large_stats_mg
-
             if not batch_inputs:
                 return
 
@@ -258,20 +374,12 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
                     target_mg, self.filter_names_mg, self.names_dic_mg
                 )
 
-                pred_raw = torch.from_numpy(output_np[b]).float()
-                det = nms_one(
-                    pred_raw,
-                    conf_thres=self.conf_thres,
-                    iou_thres=self.iou_thres,
-                    max_det=self.max_det,
+                pred = postprocess_output(
+                    output_per_image=output_np[b],
+                    orig_hw=(im0.shape[0], im0.shape[1]),
+                    input_wh=self.input_wh,
+                    score_thresh=self.conf_thres,
                 )
-
-                if len(det):
-                    det[:, :4] = scale_boxes(self.input_hw, det[:, :4], im0.shape).round()
-                    pred = det.cpu().numpy()
-                else:
-                    pred = np.array([])
-
                 pred, min_pred, medium_pred, large_pred = utils.filter_label(pred, self.filter_names, self.names_dic)
                 pred_mg = utils.merge_label(pred, self.names, self.names_merge, self.names_dic_mg)
                 pred_mg, min_pred_mg, medium_pred_mg, large_pred_mg = utils.filter_label(
@@ -298,7 +406,7 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
             im0 = cv2.imread(img_path)
             if im0 is None:
                 continue
-            batch_inputs.append(preprocess_image(im0, self.input_wh, self.stride))
+            batch_inputs.append(preprocess_image(im0, self.input_wh))
             batch_img_paths.append(img_path)
             batch_raw_images.append(im0)
 
@@ -307,8 +415,13 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
 
         flush_batch()
 
-        # Use map25-70 as the evaluate metric.
+        if not stats and not stats_mg:
+            return 0.0
+
+        map_weighted = 0.0
         _, _, _, _, _, _, _, map_weighted, _, _, _, _, _, _ = utils.mAP(stats_mg, self.names_dic_mg)
+
+        # Prefer merged metric for smoke dataset evaluation.
         return float(map_weighted)
 
     def metric_eval(self, original_metric: float, new_metric: float):
@@ -317,25 +430,25 @@ class PersonCarAutoCalibrationEvaluator(AutoCalibrationEvaluatorBase):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="AMCT ONNX auto quantization for PersonCarAnimal model")
+    parser = argparse.ArgumentParser(description="AMCT ONNX auto quantization for SmokePhone model")
     parser.add_argument(
         "--model",
-        default="/workspace/models/PersonCarAnimal_od-v3-x-bestp-d4-416-768_20251203.onnx",
+        default="/workspace/models/SmokePhone_od-v5-1-x-best-d4-416-224-opset16_20251104_no_layernorm.onnx",
         help="Path to ONNX model",
     )
     parser.add_argument(
-        "--calibration-dir",
-        default="/workspace/datasets/person_car_animal-1101",
-        help="Calibration image directory",
+        "--calibration-npy",
+        default="/workspace/smoke_phone-416-768.npy",
+        help="Preprocessed calibration data .npy (NCHW/NHWC)",
     )
     parser.add_argument(
         "--eval-data-dir",
-        default="/workspace/AlgoServerScript/datasets/person_car",
+        default="/workspace/AlgoServerScript/datasets/smoke_phone",
         help="Evaluation dataset root (contains images/ and labels/)",
     )
     parser.add_argument(
         "--output-dir",
-        default="/workspace/quantization/out/auto_quant_personcar_result_2",
+        default="/workspace/quantization/out/auto_quant_smoke_result_2",
         help="Output directory",
     )
     parser.add_argument("--batch-num", type=int, default=4, help="Calibration batch number")
@@ -355,18 +468,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--expected-metric-loss",
         type=float,
-        default=0.001,
+        default=0.5,
         help="Allowed mAP loss (absolute value)",
     )
-    parser.add_argument("--input-width", type=int, default=768, help="Model input width")
+    parser.add_argument("--input-width", type=int, default=224, help="Model input width")
     parser.add_argument("--input-height", type=int, default=416, help="Model input height")
-    parser.add_argument("--conf-thres", type=float, default=0.25, help="Score threshold for NMS")
-    parser.add_argument("--iou-thres", type=float, default=0.45, help="IoU threshold for NMS")
-    parser.add_argument("--max-det", type=int, default=300, help="Max detections per image")
+    parser.add_argument("--conf-thres", type=float, default=0.5, help="Score threshold")
+    parser.add_argument("--iou-thres", type=float, default=0.45, help="Reserved for compatibility")
+    parser.add_argument("--max-det", type=int, default=300, help="Reserved for compatibility")
     parser.add_argument(
         "--eval-max-images",
         type=int,
-        default=0,
+        default=10,
         help="Max eval images. Set 0 to evaluate all images.",
     )
     parser.add_argument("--strategy", default="BinarySearch", help="Auto calibration strategy")
@@ -402,9 +515,9 @@ def main():
     if not os.path.isfile(model_file):
         raise RuntimeError(f"Model not found: {model_file}")
 
-    calibration_dir = os.path.realpath(args.calibration_dir)
-    if not os.path.isdir(calibration_dir):
-        raise RuntimeError(f"Calibration directory not found: {calibration_dir}")
+    calibration_npy = os.path.realpath(args.calibration_npy)
+    if not os.path.isfile(calibration_npy):
+        raise RuntimeError(f"Calibration npy not found: {calibration_npy}")
 
     eval_data_dir = os.path.realpath(args.eval_data_dir)
     if not os.path.isdir(eval_data_dir):
@@ -415,7 +528,7 @@ def main():
 
     config_file = os.path.join(output_dir, "config.json")
     record_file = os.path.join(output_dir, "scale_offset_record.txt")
-    save_prefix = os.path.join(output_dir, "personcar_model")
+    save_prefix = os.path.join(output_dir, "smoke_model")
     skip_layers = [s.strip() for s in args.skip_layers.split(",") if s.strip()]
 
     amct.create_quant_config(
@@ -426,8 +539,8 @@ def main():
         activation_offset=args.activation_offset,
     )
 
-    evaluator = PersonCarAutoCalibrationEvaluator(
-        calibration_dir=calibration_dir,
+    evaluator = SmokeAutoCalibrationEvaluator(
+        calibration_npy=calibration_npy,
         eval_data_dir=eval_data_dir,
         batch_num=args.batch_num,
         batch_size=args.batch_size,
@@ -437,16 +550,11 @@ def main():
         input_width=args.input_width,
         input_height=args.input_height,
         conf_thres=args.conf_thres,
-        iou_thres=args.iou_thres,
-        max_det=args.max_det,
         eval_max_images=args.eval_max_images,
     )
 
-    from incremental_strategy import IncrementalStrategy # 导入自定义增量策略
+    from incremental_strategy import IncrementalStrategy
 
-    # 调用AMCT量化
-    # 使用增量策略（适合精度差一点点的场景）
-    # step_ratio=0.05 表示每次还原5%的层，在速度和精度之间取得平衡
     incremental_strategy = IncrementalStrategy(step_ratio=0.2, min_step=1)
 
     amct.accuracy_based_auto_calibration(
@@ -455,7 +563,6 @@ def main():
         config_file=config_file,
         record_file=record_file,
         save_dir=save_prefix,
-        # strategy=args.strategy,
         strategy=incremental_strategy,
         sensitivity=args.sensitivity,
     )

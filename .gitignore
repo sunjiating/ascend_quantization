@@ -14,10 +14,19 @@ zz_temp/
 *.pt
 *.om
 
+*.jpg
+*.jpeg
+*.png
+
+*.npy
+
 CANN社区版 8.5.0 AMCT模型压缩工具用户指南 01*
+CANN商用版 8.5.0 Ascend C算子开发指南 01*
 
 plot/
 out/
 
 fusion_result.json
+check_result.json
 out.txt
+ge_check_op.json
